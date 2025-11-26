@@ -1,0 +1,107 @@
+# General
+seed: 77
+exp_name: "mem_baseline"
+# exp_name: "debug"
+output_parent_dir: "results/d2n_cfg"
+scene_dataset_config_path: "data/hm3d_annotated_basis.scene_dataset_config.json"
+scene_data_path: "data/scene_datasets/hm3d/"
+test_data_dir: "data/goat_bench/val_unseen/content/"
+
+concept_graph_config_path: "cfg/concept_graph_default.yaml"
+
+# detection model
+yolo_model_name: yolov8x-world.pt
+sam_model_name: sam_l.pt
+class_set: scannet200
+
+# snapshot & memory
+min_detection: 1
+snapshot_min_detection: 2
+snapshot_include_dist: 4.0
+
+# agent
+agent:
+  height: 1.41
+  radius: 0.17
+  step_size: 0.25
+  turn_angle: 30.0
+  tilt_angle: 30.0
+
+# camera
+camera_height: 1.5
+camera_tilt_deg: -30
+img_width: 1280
+img_height: 1280
+hfov: 120
+
+# evaluation
+success_distance: 1.0
+clear_up_memory_every_subtask: false
+use_full_obj_list: false
+
+# logging & visualization
+save_visualization: true
+prompt_w: 360
+prompt_h: 360
+
+# DescriptorExtractor
+use_chain_descriptors: true
+gpt_model: "gpt-4o"
+descriptors_per_frontier: 4
+
+# navigation
+init_clearance: 0.3
+max_step_room_size_ratio: 2
+num_scan_views: 6
+
+# tsdf / frontier updates
+explored_depth: 1.7
+tsdf_grid_size: 0.1
+margin_w_ratio: 0.25
+margin_h_ratio: 0.6
+planner:
+  eps: 1
+  max_dist_from_cur_phase_1: 1
+  max_dist_from_cur_phase_2: 1
+  final_observe_distance: 1.5
+  surrounding_explored_radius: 0.7
+
+  frontier_edge_area_min: 4
+  frontier_edge_area_max: 6
+  frontier_area_min: 8
+  frontier_area_max: 9
+  min_frontier_area: 20
+  max_frontier_angle_range_deg: 150
+  region_equal_threshold: 0.80
+
+# scene graph
+scene_graph:
+  confidence: 0.003
+  nms_threshold: 0.1
+  iou_threshold: 0.5
+  obj_include_dist: 3.5
+  target_obj_iou_threshold: 0.6
+
+# SigLIP
+siglip_backend: "open_clip"
+siglip_model_name: "ViT-B-16-SigLIP-384"
+siglip_pretrained: "webli"
+
+# Navigation scoring
+goal_verification_threshold: 0.45
+direct_goal_detect_conf: 0.4
+relevant_view_angle_threshold_deg: 30
+
+# Frontier evaluation
+w_itm_score: 1.0
+w_vlm_score: 0.0
+use_frontier_grouping: false
+low_score_threshold: 0.5
+tie_breaking_threshold: 0.05
+
+# Observation memory settings
+observation_diversity_distance_m: 1.0
+observation_diversity_angle_deg: 45.0
+semantic_novelty_threshold: 0.85
+memory_candidates_k: 1
+

@@ -9,6 +9,10 @@ os.environ["MAGNUM_LOG"] = "quiet"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+# OpenAI API 키 설정
+from src.const import OPENAI_KEY
+os.environ["OPENAI_API_KEY"] = OPENAI_KEY
+
 import argparse
 from omegaconf import OmegaConf
 import random
@@ -18,30 +22,29 @@ import math
 import time
 import json
 import logging
-import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
-from typing import Dict, Optional, Any, Tuple, List
+from typing import Dict, Optional, Any, Tuple, List, Set, Union
 from dataclasses import dataclass, field
 import habitat_sim
-import cv2 # Added for cv2.resize
+from PIL import Image
+import cv2
 
 from ultralytics import SAM, YOLOWorld
 
-from mzson.habitat import (
-    pose_habitat_to_tsdf, pos_habitat_to_normal, pos_normal_to_habitat
+from src.habitat import (
+    pose_habitat_to_tsdf, pos_habitat_to_normal
 )
-from mzson.geom import get_cam_intr, get_scene_bnds
-from mzson.tsdf_planner import TSDFPlanner
-from mzson.scene_goatbench import Scene
-from mzson.utils import (
+from src.geom import get_cam_intr, get_scene_bnds
+from src.tsdf_planner import TSDFPlanner
+from src.scene_goatbench import Scene
+from src.utils import (
     resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench,
     get_point_from_mask
 )
-from mzson.goatbench_utils import prepare_goatbench_navigation_goals
-from mzson.logger import MZSONLogger
-from mzson.siglip_itm import SigLipITM
-from mzson.descriptor_extractor import DescriptorExtractor, DescriptorExtractorConfig
-from mzson.data_models import Frontier
+from src.goatbench_utils import prepare_goatbench_navigation_goals
+from src.logger_mzson import MZSONLogger
+from src.siglip_itm import SigLipITM
+from src.descriptor_extractor import DescriptorExtractor, DescriptorExtractorConfig
+from src.data_models import Frontier
 
 
 class ElapsedTimeFormatter(logging.Formatter):
@@ -329,18 +332,10 @@ def run_evaluation(app_state: AppState, start_ratio: float, end_ratio: float, sp
                 floor_height = pts[1]
                 tsdf_bnds, scene_size = get_scene_bnds(scene.pathfinder, floor_height)
                 max_steps = max(int(math.sqrt(scene_size) * cfg.max_step_room_size_ratio), 50)
-                
-                tsdf_planner = TSDFPlanner(
-                    vol_bnds=tsdf_bnds, voxel_size=cfg.tsdf_grid_size, floor_height=floor_height,
-                    floor_height_offset=0, pts_init=pts, init_clearance=cfg.init_clearance * 2,
-                    save_visualization=cfg.save_visualization,
-                )
 
                 episode_context = {
                     "start_position": pts, "floor_height": floor_height, "tsdf_bounds": tsdf_bnds,
                     "visited_positions": [], "observations_history": [], "step_count": 0,
-                    "tsdf_planner": tsdf_planner,
-                    "observation_memory": [],
                     "subtask_observation_cache": {}, # Initialize short-term cache
                     "subtask_id": f"{scene_id}_{episode_id}", # Initialize subtask_id
                     "subtask_goal_str": "N/A", # Initialize subtask_goal_str
@@ -349,7 +344,7 @@ def run_evaluation(app_state: AppState, start_ratio: float, end_ratio: float, sp
 
                 app_state.logger.init_episode(scene_id=scene_id, episode_id=episode_id)
 
-                global_step = 0 # FIX: Changed from -1 to 0 to align with 1-based cnt_step
+                global_step = 0
                 for subtask_idx, (goal_type, subtask_goal) in enumerate(
                     zip(all_subtask_goal_types, all_subtask_goals)
                 ):
@@ -360,8 +355,17 @@ def run_evaluation(app_state: AppState, start_ratio: float, end_ratio: float, sp
                         logging.info(f"Subtask {subtask_idx + 1}/{len(all_subtask_goals)} already done!")
                         continue
 
+                    # NOTE: 매 subtask마다 새로운 TSDF planner 생성 (frontier 완전 초기화)
+                    # 현재 위치(pts)에서 TSDF를 시작합니다.
+                    logging.info(f"Creating new TSDF planner for subtask {subtask_idx + 1} from current position (frontier reset)")
+                    tsdf_planner = TSDFPlanner(
+                        vol_bnds=tsdf_bnds, voxel_size=cfg.tsdf_grid_size, floor_height=floor_height,
+                        floor_height_offset=0, pts_init=pts, init_clearance=cfg.init_clearance * 2,
+                        save_visualization=cfg.save_visualization,
+                    )
+                    episode_context["tsdf_planner"] = tsdf_planner
+
                     # subtask_goal 파싱 및 메타데이터 생성은 logger.init_subtask가 담당.
-                    # 베이스라인 코드와 동일한 구조.
                     subtask_metadata = app_state.logger.init_subtask(
                         subtask_id=subtask_id,
                         goal_type=goal_type,
@@ -387,6 +391,8 @@ def run_evaluation(app_state: AppState, start_ratio: float, end_ratio: float, sp
                         tsdf_planner=tsdf_planner,
                     )
                     global_step = task_result.get("final_global_step", global_step)
+                    pts = task_result.get("final_position", pts)
+                    angle = task_result.get("final_angle", angle)
                     
                 app_state.logger.save_results()
                 if not cfg.save_visualization:
@@ -510,28 +516,23 @@ def run_subtask(
     tsdf_planner: TSDFPlanner,
 ):
     """
-    하나의 서브태스크(예: '소파로 이동')를 자율적으로 수행합니다.
-    내부적으로 동적 관측 메모리를 활용한 계층적 탐색 전략을 사용합니다.
+    하나의 서브태스크를 자율적으로 수행합니다.
+    NOTE: 메모리는 초기화되지만, 에이전트 위치는 이전 subtask에서 이어받음
     """
     # Initialize the observation history for this specific subtask
     episode_context["subtask_full_observation_history"] = {}
     episode_context["frontier_score_cache"] = {} # Initialize score cache for this subtask
 
-    # Ensure no carry-over target from previous subtask
-    try:
-        tsdf_planner.max_point = None
-        tsdf_planner.target_point = None
-    except Exception:
-        pass
-
-    # Optionally clear memory at the start of each subtask
-    # episode_context["observation_memory"].clear() 
-
     goal = subtask_metadata.get("goal")
     goal_type = subtask_metadata.get("goal_type")
     original_goal_str = subtask_metadata.get("question", subtask_id)
+    
+    # 초기 상태 설정
+    current_pts = pts.copy()
+    current_angle = angle
+    success_by_distance = False
 
-    # --- 목표 분석 및 target_objects 추출 (run_mzson_nomem.py의 검증된 로직 사용) ---
+    # --- Phase 1: Goal Pre-processing ---
     target_objects = []
     if goal_type == "object":
         target_objects = goal if isinstance(goal, list) else [goal]
@@ -541,7 +542,7 @@ def run_subtask(
         target_objects = main_targets
     elif goal_type == "image":
         logging.info("Goal is an image. Extracting keywords for ITM scoring...")
-        target_objects = app_state.desc_extractor.extract_keywords_from_image(goal)
+        target_objects = app_state.desc_extractor.extract_keywords_from_image_modified(goal)
         logging.info(f"Extracted keywords from image goal: {target_objects}")
     
     logging.info(f"Refined Target Objects: {target_objects}")
@@ -550,12 +551,7 @@ def run_subtask(
     episode_context["target_objects"] = target_objects if isinstance(target_objects, list) else []
     episode_context["subtask_goal_str"] = original_goal_str
 
-    # 초기 상태 설정
-    current_pts = pts.copy()
-    current_angle = angle
-    success_by_distance = False # task_success 대신 이 변수를 사용해 최종 성공 여부를 기록합니다.
-
-    # --- Phase 1: Memory warm-start (Top-k candidates) ---
+    # --- Phase 1.5: Memory warm-start (Top-k candidates) ---
     top_k = int(getattr(app_state.cfg, "memory_candidates_k", 3))
     # For image goals, use extracted keywords as text targets for memory lookup
     mem_goal_type = "object" if goal_type == "image" else goal_type
@@ -589,143 +585,138 @@ def run_subtask(
     else:
         logging.info("Phase 1 SKIP: No high-confidence memory found. Starting with Phase 2 (Exploration).")
 
-
-    tracked_goal_path = None
-
     # run steps
     cnt_step = 0
     while cnt_step < max_steps:
         cnt_step += 1
         global_step += 1
         
-        candidates_info = None # 시각화 정보를 위해 루프 시작 시 초기화
+        candidates_info = None
 
         # --- Phase 2: 계층적 전략 수행 ---
-        if navigation_mode == "exploration":
-            # [REVISED LOGIC]
-            # 목표 지속성(Goal Persistence)을 적용합니다.
-            # 장기 목표(max_point)가 없을 때만 새로운 목표를 선택합니다.
-            if tsdf_planner.max_point is None:
-                logging.info("No long-term target. Stop, Scan, and Select.")
+        # 목표 지속성(Goal Persistence)을 적용합니다.
+        if tsdf_planner.max_point is None:
+            logging.info("No long-term target. Stop, Scan, and Select.")
 
-                # --- 1. 항상 관측 및 맵 업데이트 수행 ---
-                current_step_observations = _observe_and_update_maps(
-                    scene=scene, tsdf_planner=tsdf_planner, current_pts=current_pts,
-                    current_angle=current_angle, cnt_step=cnt_step, cfg=app_state.cfg,
-                    cam_intr=app_state.cam_intr, min_depth=app_state.min_depth,
-                    max_depth=app_state.max_depth, eps_frontier_dir=app_state.logger.get_frontier_dir(),
-                )
-                
-                for obs in current_step_observations:
-                    episode_context["subtask_full_observation_history"][obs['name']] = obs
-
-                for frontier in tsdf_planner.frontiers:
-                    if frontier.source_observation_name is None:
-                        relevant_obs_list = get_relevant_observations(
-                            frontier, current_step_observations,
-                            app_state.cfg.relevant_view_angle_threshold_deg
-                        )
-                        if len(relevant_obs_list) > 0:
-                            frontier.source_observation_name = relevant_obs_list[0]['name']
-                            frontier.cam_pose = relevant_obs_list[0]['cam_pose']
-                            frontier.depth = relevant_obs_list[0]['depth']
-
-                # --- 2. 장기 기억 업데이트 (메모리 버전의 핵심 로직) ---
-                frontier_source_obs_names = {f.source_observation_name for f in tsdf_planner.frontiers if f.source_observation_name}
-                observations_to_analyze = [
-                    obs for obs in current_step_observations 
-                    if obs['name'] in frontier_source_obs_names
-                ]
-                logging.info(f"Analyzing {len(observations_to_analyze)} new frontier source images for semantic memory.")
-                _analyze_and_store_semantic_memory(
-                    observations_to_analyze, episode_context, app_state
-                )
-
-                # --- 3. 캐시 업데이트 ---
-                active_frontier_ids = {f.frontier_id for f in tsdf_planner.frontiers}
-                required_obs_names = {f.source_observation_name for f in tsdf_planner.frontiers if f.source_observation_name}
-                episode_context["subtask_observation_cache"] = {
-                    name: obs for name, obs in episode_context["subtask_full_observation_history"].items() if name in required_obs_names
-                }
-                current_cache = episode_context.get("frontier_score_cache", {})
-                episode_context["frontier_score_cache"] = {
-                    fid: score_data for fid, score_data in current_cache.items() if fid in active_frontier_ids
-                }
-
-                # Fallback: force-link frontier to nearest observation if none linked
-                if not required_obs_names and tsdf_planner.frontiers:
-                    if episode_context["subtask_full_observation_history"]:
-                        any_obs = next(iter(episode_context["subtask_full_observation_history"].values()))
-                        for frontier in tsdf_planner.frontiers:
-                            if frontier.source_observation_name is None:
-                                frontier.source_observation_name = any_obs['name']
-                                frontier.cam_pose = any_obs['cam_pose']
-                                frontier.depth = any_obs['depth']
-                        episode_context["subtask_observation_cache"][any_obs['name']] = any_obs
-
-                # --- 4. 새로운 목표 선택 (통합된 단일 호출) ---
-                logging.info("Using unified target selection (frontiers + memory)...")
-                selection_dir = os.path.join(app_state.logger.subtask_dir, "selection")
-                chosen_target, candidates_info = _select_next_target(
-                    app_state=app_state, episode_context=episode_context,
-                    current_pts=current_pts,
-                    goal=goal,
-                    goal_type=goal_type,
-                    original_goal_str=original_goal_str,
-                    tsdf_planner=tsdf_planner,
-                    selection_dir=selection_dir,
-                    target_objects=target_objects,
-                    mem_candidates=mem_candidates, # Pass remaining memory candidates
-                )
-                if not chosen_target:
-                    logging.warning("Failed to select a new target. Will re-scan next step.")
-                # 새로운 목표가 선택되면 설정
-                if chosen_target:
-                    # The returned choice can be a Frontier or an AnalyzedObservation (from memory)
-                    if isinstance(chosen_target, Frontier):
-                        set_ok = tsdf_planner.set_next_navigation_point(
-                            choice=chosen_target,
-                            pts=current_pts,
-                            objects=scene.objects,
-                            cfg=app_state.cfg.planner,
-                            pathfinder=scene.pathfinder
-                        )
-                    elif isinstance(chosen_target, AnalyzedObservation):
-                            # For memory candidates, we directly set the target point
-                        set_ok = tsdf_planner.set_target_point_from_observation(chosen_target.map_pos)
-                        if set_ok:
-                            episode_context["warmstart_angle"] = chosen_target.angle
-                    else:
-                        set_ok = False
-                        logging.error(f"Unknown target type from _select_next_target: {type(chosen_target)}")
-
-                    if not set_ok:
-                        logging.warning("Failed to set navigation point for newly chosen target. Will retry next step.")
-                        tsdf_planner.max_point = None
-                        tsdf_planner.target_point = None
+            # --- 1. 항상 관측 및 맵 업데이트 수행 ---
+            current_step_observations = _observe_and_update_maps(
+                scene=scene, tsdf_planner=tsdf_planner, current_pts=current_pts,
+                current_angle=current_angle, cnt_step=cnt_step, cfg=app_state.cfg,
+                cam_intr=app_state.cam_intr, min_depth=app_state.min_depth,
+                max_depth=app_state.max_depth, eps_frontier_dir=app_state.logger.get_frontier_dir(),
+            )
             
-            # 장기 목표는 있지만 단기 길목이 없다면 (예: 중간 길목에 도착한 후),
-            # 장기 목표를 향한 다음 단기 길목을 계산합니다.
-            elif tsdf_planner.target_point is None:
-                logging.info(f"Committed target exists. Calculating next waypoint.")
-                set_ok = tsdf_planner.set_next_navigation_point(
-                    choice=tsdf_planner.max_point,
-                    pts=current_pts,
-                    objects=scene.objects,
-                    cfg=app_state.cfg.planner,
-                    pathfinder=scene.pathfinder
+            for obs in current_step_observations:
+                episode_context["subtask_full_observation_history"][obs['name']] = obs
+
+            for frontier in tsdf_planner.frontiers:
+                if frontier.source_observation_name is None:
+                    relevant_obs_list = get_relevant_observations(
+                        frontier, current_step_observations,
+                        app_state.cfg.relevant_view_angle_threshold_deg
+                    )
+                    if len(relevant_obs_list) > 0:
+                        frontier.source_observation_name = relevant_obs_list[0]['name']
+                        frontier.cam_pose = relevant_obs_list[0]['cam_pose']
+                        frontier.depth = relevant_obs_list[0]['depth']
+
+            # --- 2. 장기 기억 업데이트 (3D-Mem 스타일: 모든 observation 저장) ---
+            # 3D-Mem의 scene.update_snapshots()와 유사하게 모든 observation을 처리
+            # 중복 방지를 위해 이미 저장된 observation은 건너뜀
+            existing_obs_names = {mem.name for mem in app_state.observation_memory}
+            new_observations = [
+                obs for obs in current_step_observations 
+                if obs['name'] not in existing_obs_names
+            ]
+            if new_observations:
+                logging.info(f"Storing {len(new_observations)} new observations in semantic memory (3D-Mem style).")
+                _analyze_and_store_semantic_memory(
+                    new_observations, episode_context, app_state
                 )
-                # 경로 계산 실패 시, 장기 목표를 포기하고 다음 스텝에서 재평가합니다.
+
+            # --- 3. 캐시 업데이트 ---
+            active_frontier_ids = {f.frontier_id for f in tsdf_planner.frontiers}
+            required_obs_names = {f.source_observation_name for f in tsdf_planner.frontiers if f.source_observation_name}
+            episode_context["subtask_observation_cache"] = {
+                name: obs for name, obs in episode_context["subtask_full_observation_history"].items() if name in required_obs_names
+            }
+            current_cache = episode_context.get("frontier_score_cache", {})
+            episode_context["frontier_score_cache"] = {
+                fid: score_data for fid, score_data in current_cache.items() if fid in active_frontier_ids
+            }
+
+            # Fallback: force-link frontier to nearest observation if none linked
+            if not required_obs_names and tsdf_planner.frontiers:
+                if episode_context["subtask_full_observation_history"]:
+                    any_obs = next(iter(episode_context["subtask_full_observation_history"].values()))
+                    for frontier in tsdf_planner.frontiers:
+                        if frontier.source_observation_name is None:
+                            frontier.source_observation_name = any_obs['name']
+                            frontier.cam_pose = any_obs['cam_pose']
+                            frontier.depth = any_obs['depth']
+                    episode_context["subtask_observation_cache"][any_obs['name']] = any_obs
+
+            # --- 4. 새로운 목표 선택 (통합된 단일 호출) ---
+            logging.info("Using unified target selection (frontiers + memory)...")
+            selection_dir = os.path.join(app_state.logger.subtask_dir, "selection")
+            chosen_target, candidates_info = _select_next_target(
+                app_state=app_state, episode_context=episode_context,
+                current_pts=current_pts,
+                goal=goal,
+                goal_type=goal_type,
+                original_goal_str=original_goal_str,
+                tsdf_planner=tsdf_planner,
+                selection_dir=selection_dir,
+                target_objects=target_objects,
+                mem_candidates=mem_candidates, # Pass remaining memory candidates
+            )
+            if not chosen_target:
+                logging.warning("Failed to select a new target. Will re-scan next step.")
+            # 새로운 목표가 선택되면 설정
+            if chosen_target:
+                # The returned choice can be a Frontier or an AnalyzedObservation (from memory)
+                if isinstance(chosen_target, Frontier):
+                    set_ok = tsdf_planner.set_next_navigation_point(
+                        choice=chosen_target,
+                        pts=current_pts,
+                        objects=scene.objects,
+                        cfg=app_state.cfg.planner,
+                        pathfinder=scene.pathfinder
+                    )
+                elif isinstance(chosen_target, AnalyzedObservation):
+                    # For memory candidates, we directly set the target point
+                    set_ok = tsdf_planner.set_target_point_from_observation(chosen_target.map_pos)
+                    if set_ok:
+                        episode_context["warmstart_angle"] = chosen_target.angle
+                else:
+                    set_ok = False
+                    logging.error(f"Unknown target type from _select_next_target: {type(chosen_target)}")
+
                 if not set_ok:
-                    logging.warning("Failed to find path to committed target. Clearing for re-evaluation.")
+                    logging.warning("Failed to set navigation point for newly chosen target. Will retry next step.")
                     tsdf_planner.max_point = None
                     tsdf_planner.target_point = None
-            
-            else: # 장기/단기 목표가 모두 있으면 계속 진행합니다.
-                logging.info(f"Continuing towards current target: {tsdf_planner.target_point}")
+
+        elif tsdf_planner.target_point is None:
+            logging.info(f"Committed target exists. Calculating next waypoint.")
+            set_ok = tsdf_planner.set_next_navigation_point(
+                choice=tsdf_planner.max_point,
+                pts=current_pts,
+                objects=scene.objects,
+                cfg=app_state.cfg.planner,
+                pathfinder=scene.pathfinder
+            )
+            # 경로 계산 실패 시, 장기 목표를 포기하고 다음 스텝에서 재평가합니다.
+            if not set_ok:
+                logging.warning("Failed to find path to committed target. Clearing for re-evaluation.")
+                tsdf_planner.max_point = None
+                tsdf_planner.target_point = None
+        
+        else: # 장기/단기 목표가 모두 있으면 계속 진행합니다.
+            logging.info(f"Continuing towards current target: {tsdf_planner.target_point}")
 
 
-        elif navigation_mode == "memory_driven":
+        if navigation_mode == "memory_driven":
             # In Phase 1, we just navigate. If we arrive, we will re-evaluate.
             logging.info(f"Phase 1 In Progress: Navigating towards memory candidate at {tsdf_planner.max_point.position}")
 
@@ -741,7 +732,6 @@ def run_subtask(
             snapshots=scene.snapshots,
             pathfinder=scene.pathfinder,
             cfg=app_state.cfg.planner if hasattr(app_state.cfg, "planner") else app_state.cfg,
-            path_points=tracked_goal_path, # 목표 추적 모드일 때 경로 전달
             save_visualization=app_state.cfg.save_visualization,
         )
 
@@ -770,23 +760,51 @@ def run_subtask(
                 
                 if navigation_mode == "memory_driven" and dist_to_max_point_m < 0.5:
                     logging.info(f"Phase 1 COMPLETE: Arrived at memory candidate location.")
-                    # 도착 후 주변을 스캔하고, 목표가 보이지 않으면 Phase 2로 전환해야 함.
-                    # 우선은 도착 시 바로 Phase 2로 전환하여 재평가하도록 구현.
-                    tsdf_planner.max_point = None # 장기 목표 초기화
-                    navigation_mode = "exploration"
-                    logging.info("Switching to Phase 2 (Exploration) for re-evaluation.")
+                    # 도착 후 주변을 스캔하고 goal object 검증
+                    # 먼저 현재 위치에서 관측을 수행하여 goal object가 실제로 있는지 확인
+                    temp_observations = _observe_and_update_maps(
+                        scene=scene, tsdf_planner=tsdf_planner, current_pts=current_pts,
+                        current_angle=current_angle, cnt_step=cnt_step, cfg=app_state.cfg,
+                        cam_intr=app_state.cam_intr, min_depth=app_state.min_depth,
+                        max_depth=app_state.max_depth, eps_frontier_dir=app_state.logger.get_frontier_dir(),
+                    )
+                    
+                    # Goal object 검증 (object goal인 경우에만)
+                    goal_found = False
+                    if goal_type == "object":
+                        goal_found, goal_voxel = _detect_and_verify_goal_in_views(
+                            current_step_observations=temp_observations,
+                            goal=goal,
+                            scene=scene,
+                            tsdf_planner=tsdf_planner,
+                            app_state=app_state,
+                        )
+                        if goal_found:
+                            logging.info(f"Goal object verified at memory location! Goal voxel: {goal_voxel}")
+                            # Goal object가 발견되었으므로 해당 위치로 최종 목표 설정
+                            from src.tsdf_planner import SnapShot
+                            tsdf_planner.max_point = SnapShot(
+                                image='verified_goal',
+                                color=(0, 255, 0),
+                                obs_point=goal_voxel,
+                                position=goal_voxel
+                            )
+                            # Goal object 위치로 이동 계속
+                            navigation_mode = "exploration"  # Goal object로 navigation
+                        else:
+                            logging.info("Goal object NOT found at memory location. Switching to Phase 2 (Exploration).")
+                            tsdf_planner.max_point = None
+                            navigation_mode = "exploration"
+                    else:
+                        # Description/image goal인 경우, 메모리 위치가 유망하므로 exploration으로 전환
+                        logging.info("Memory location reached. Continuing with Phase 2 (Exploration) for refinement.")
+                        tsdf_planner.max_point = None
+                        navigation_mode = "exploration"
 
                 elif navigation_mode == "exploration" and dist_to_max_point_m < 0.5: 
                     logging.info("Vicinity of long-term target reached. Clearing for full re-evaluation.")
                     tsdf_planner.max_point = None # 장기 목표를 초기화하여 다음 스텝에서 재평가하도록 합니다.
 
-        # 목표 추적/정보 수집 단계에서 목적지에 도착했을 때 처리
-        if waypoint_arrived:
-            if navigation_mode == "goal_tracking": # This mode seems unused in the original file, but keeping the logic
-                logging.info("Arrived at tracked goal destination! Reverting to EXPLORATION mode.")
-                navigation_mode = "exploration"
-                tracked_goal_path = None
-            
         # --- Visualization (optional) ---
         if app_state.cfg.save_visualization and fig is not None:
             # Prepare visualization info from the selection process if it happened in this step
@@ -850,18 +868,6 @@ def run_subtask(
             )
             break
 
-        # If the goal is found and we are close enough, call STOP
-        if navigation_mode == "goal_tracking" and waypoint_arrived:
-            # We have reached the destination planned by _detect_and_verify_goal
-            # Now check if we are actually close to the goal viewpoints
-            # 위에서 이미 success_by_distance로 체크하고 break 하므로, 이 블록은 사실상 도달하기 어려움.
-            # 하지만 혹시 모를 상황을 위해 유지.
-            logging.info(
-                f"INFO: Goal tracking arrived at destination. Distance to goal is {agent_subtask_distance:.2f}m."
-            )
-            # 이미 위에서 break 되었으므로, 이곳의 break는 제거하거나 주석처리해도 무방.
-            # break
-            
         # Check for max steps
         if cnt_step >= max_steps:
             logging.warning(f"Max steps reached ({max_steps}). Ending subtask.")
@@ -1151,11 +1157,21 @@ def _select_next_target(
             )
             
             # Log if the winner changed
-            if best_in_tie['candidate']['data'].frontier_id != best_candidate_data['candidate']['data'].frontier_id:
+            # Helper function to get candidate identifier
+            def get_candidate_id(cand):
+                if cand['candidate']['type'] == 'frontier':
+                    return cand['candidate']['data'].frontier_id
+                else:  # memory
+                    return cand['candidate']['data'].name
+            
+            best_in_tie_id = get_candidate_id(best_in_tie)
+            best_candidate_data_id = get_candidate_id(best_candidate_data)
+            
+            if best_in_tie_id != best_candidate_data_id:
                 original_winner = best_candidate_data
-                logging.info(f"Tie-breaker chose Candidate {best_in_tie['candidate']['data'].frontier_id if best_in_tie['candidate']['type'] == 'frontier' else best_in_tie['candidate']['data'].name} "
+                logging.info(f"Tie-breaker chose Candidate {best_in_tie_id} "
                              f"(Combined: {best_in_tie['semantic_score'] + best_in_tie['exploration_score']:.3f}) "
-                             f"over Candidate {original_winner['candidate']['data'].frontier_id if original_winner['candidate']['type'] == 'frontier' else original_winner['candidate']['data'].name} "
+                             f"over Candidate {best_candidate_data_id} "
                              f"(Combined: {original_winner['semantic_score'] + original_winner['exploration_score']:.3f}).")
             
             best_candidate_data = best_in_tie
@@ -1182,85 +1198,89 @@ def _analyze_and_store_semantic_memory(
     app_state: AppState,
 ):
     """
-    Analyzes new observations, identifies GEOMETRICALLY and SEMANTICALLY novel ones,
-    and updates the long-term (app_state) observation memory.
+    Analyzes new observations and stores them in long-term memory (3D-Mem style).
+    Similar to scene.update_snapshots() but for descriptor-based memory.
+    Stores all observations with their descriptors and detected objects (no novelty filtering).
+    Called after observation collection, similar to how 3D-Mem calls scene.update_snapshots().
+    
+    YOLO detection is performed to detect objects in the scene, similar to 3D-Mem's object detection.
     """
     cfg = app_state.cfg
-    itm = app_state.itm
     long_term_memory = app_state.observation_memory # Use the global, persistent memory
     
-    # --- 1. Filter for Geometrically Novel Observations ---
-    diversity_dist_m = cfg.observation_diversity_distance_m
-    diversity_angle_deg = cfg.observation_diversity_angle_deg
-    diversity_angle_rad = np.deg2rad(diversity_angle_deg)
-    
-    geometrically_novel_observations = []
-    for obs in current_step_observations:
-        is_geometrically_novel = True
-        # Voxel size needs to be accessed from a planner instance.
-        tsdf_planner = episode_context.get("tsdf_planner")
-        if not tsdf_planner: continue
-        diversity_dist_vox = diversity_dist_m / tsdf_planner._voxel_size
+    for obs_data in current_step_observations:
+        # --- 1. YOLO Detection: Detect objects in the scene (3D-Mem style) ---
+        detected_objects = []
+        try:
+            # Use generic object detection (similar to 3D-Mem)
+            # YOLOWorld can detect without setting specific classes
+            results = app_state.detection_model.predict(
+                obs_data["rgb"], 
+                conf=getattr(cfg, "yolo_detection_conf", 0.1), 
+                verbose=False
+            )
+            
+            if results and len(results) > 0 and results[0].boxes is not None:
+                # Extract class names from detection results
+                class_names = results[0].names  # Dictionary mapping class_id to class_name
+                detection_class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+                confidences = results[0].boxes.conf.cpu().numpy()
+                
+                # Filter by confidence and extract unique object names
+                conf_threshold = getattr(cfg, "yolo_detection_conf", 0.1)
+                detected_objects = [
+                    class_names[int(class_id)] 
+                    for class_id, conf in zip(detection_class_ids, confidences)
+                    if conf >= conf_threshold
+                ]
+                # Remove duplicates while preserving order
+                detected_objects = list(dict.fromkeys(detected_objects))
+                
+                logging.debug(f"YOLO detected {len(detected_objects)} objects in {obs_data['name']}: {detected_objects[:5]}")
+        except Exception as e:
+            logging.warning(f"YOLO detection failed for {obs_data['name']}: {e}")
+            detected_objects = []
         
-        for mem in long_term_memory:
-            dist = np.linalg.norm(np.array(obs["map_pos"]) - np.array(mem.map_pos))
-            if dist <= diversity_dist_vox:
-                angle_diff = abs(obs["angle"] - mem.angle)
-                if angle_diff > np.pi: angle_diff = 2 * np.pi - angle_diff
-                if angle_diff <= diversity_angle_rad:
-                    is_geometrically_novel = False
-                    break
-        if is_geometrically_novel:
-            geometrically_novel_observations.append(obs)
-
-    # --- 2. Filter for Semantically Novel Observations ---
-    if not geometrically_novel_observations:
-        return
-        
-    semantic_novelty_threshold = cfg.semantic_novelty_threshold
-    
-    for obs_data in geometrically_novel_observations:
+        # --- 2. Generate descriptors for the new view ---
         # Generate descriptors for the new view. The goal string here is for broad context.
         refined_goal_str = ", ".join(episode_context.get("target_objects", []))
         if not refined_goal_str:
              refined_goal_str = episode_context.get("subtask_goal_str", "indoor scene")
 
+        # Pass detected objects to descriptor extractor (similar to 3D-Mem passing objects to scene graph)
         descriptors, _, objects_from_desc = app_state.desc_extractor.analyze_scene_for_goal(
             rgb=obs_data["rgb"],
             goal=refined_goal_str,
-            key_objects=[],
+            key_objects=detected_objects,  # Pass YOLO-detected objects
         )
         if not descriptors:
             continue
 
-        # Check for semantic novelty against long-term memory
-        is_semantically_novel = True
-        if long_term_memory:
-            memory_descriptors = [desc for mem in long_term_memory for desc in mem.descriptors]
-            if memory_descriptors:
-                scores = itm.text_text_scores(descriptors, memory_descriptors)
-                max_similarity = float(scores.max()) if scores is not None and scores.size > 0 else 0.0
-                if max_similarity >= semantic_novelty_threshold:
-                    is_semantically_novel = False
+        # --- 3. Combine detected objects and parsed objects ---
+        # Combine YOLO-detected objects with objects parsed from descriptors
+        all_objects = set(detected_objects)  # Start with YOLO detections
+        if objects_from_desc:
+            all_objects.update([o.strip() for o in objects_from_desc if isinstance(o, str) and len(o.strip()) > 0])
+        # Fallback to descriptor-as-object if no objects found
+        if not all_objects:
+            all_objects = set([d.strip() for d in descriptors if isinstance(d, str) and len(d.strip()) > 0])
         
-        if is_semantically_novel:
-            # Prefer objects parsed by analyzer; fallback to descriptor-as-object if empty
-            if objects_from_desc:
-                key_objects = list({o.strip() for o in objects_from_desc if isinstance(o, str) and len(o.strip()) > 0})
-            else:
-                key_objects = list({d.strip() for d in descriptors if isinstance(d, str) and len(d.strip()) > 0})
-            logging.info(f"Found semantically novel observation {obs_data['name']}. Storing in long-term memory.")
-            analyzed_obs = AnalyzedObservation(
-                name=obs_data["name"],
-                map_pos=obs_data["map_pos"],
-                angle=obs_data["angle"],
-                descriptors=descriptors,
-                key_objects=key_objects if key_objects else [],
-                rgb=obs_data["rgb"],
-            )
-            # Add to both for visualization and persistence
-            episode_context["observation_memory"].append(analyzed_obs)
-            app_state.observation_memory.append(analyzed_obs)
+        key_objects = list(all_objects)
+        
+        logging.info(
+            f"Storing observation {obs_data['name']} in long-term memory: "
+            f"{len(descriptors)} descriptors, {len(key_objects)} objects (YOLO: {len(detected_objects)})"
+        )
+        analyzed_obs = AnalyzedObservation(
+            name=obs_data["name"],
+            map_pos=obs_data["map_pos"],
+            angle=obs_data["angle"],
+            descriptors=descriptors,
+            key_objects=key_objects if key_objects else [],
+            rgb=obs_data["rgb"],
+        )
+        # Add to global persistent memory
+        app_state.observation_memory.append(analyzed_obs)
 
 
 def get_relevant_observations(

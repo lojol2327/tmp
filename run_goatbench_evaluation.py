@@ -23,14 +23,14 @@ import matplotlib.pyplot as plt
 import open_clip
 from ultralytics import SAM, YOLOWorld
 
-from src.habitat import pose_habitat_to_tsdf
-from src.geom import get_cam_intr, get_scene_bnds
-from src.tsdf_planner import TSDFPlanner, Frontier, SnapShot
-from src.scene_goatbench import Scene
-from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
-from src.goatbench_utils import prepare_goatbench_navigation_goals
-from src.query_vlm_goatbench import query_vlm_for_response
-from src.logger_goatbench import Logger
+from src_3dmem.habitat import pose_habitat_to_tsdf
+from src_3dmem.geom import get_cam_intr, get_scene_bnds
+from src_3dmem.tsdf_planner import TSDFPlanner, Frontier, SnapShot
+from src_3dmem.scene_goatbench import Scene
+from src_3dmem.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
+from src_3dmem.goatbench_utils import prepare_goatbench_navigation_goals
+from src_3dmem.query_vlm_goatbench import query_vlm_for_response
+from src_3dmem.logger_goatbench import Logger
 
 
 def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1):

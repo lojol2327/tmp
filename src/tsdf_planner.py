@@ -19,32 +19,7 @@ from src.habitat import pos_normal_to_habitat, pos_habitat_to_normal
 from src.tsdf_base import TSDFPlannerBase
 from src.conceptgraph.slam.slam_classes import MapObjectDict
 from src.utils import resize_image
-
-
-@dataclass
-class Frontier:
-    """Frontier class for frontier-based exploration."""
-
-    position: np.ndarray  # integer position in voxel grid
-    orientation: np.ndarray  # directional vector of the frontier in float
-    region: (
-        np.ndarray
-    )  # boolean array of the same shape as the voxel grid, indicating the region of the frontier
-    frontier_id: (
-        int  # unique id for the frontier to identify its region on the frontier map
-    )
-    image: str = None
-    target_detected: bool = (
-        False  # whether the target object is detected in the snapshot, only used when generating data
-    )
-    feature: torch.Tensor = (
-        None  # the image feature of the snapshot, not used when generating data
-    )
-
-    def __eq__(self, other):
-        if not isinstance(other, Frontier):
-            raise TypeError("Cannot compare Frontier with non-Frontier object.")
-        return np.array_equal(self.region, other.region)
+from .data_models import Frontier
 
 
 @dataclass
@@ -87,6 +62,7 @@ class TSDFPlanner(TSDFPlannerBase):
         occupancy_height=0.4,
         vision_height=1.2,
         save_visualization=False,
+        enable_frontier_grouping: bool = False,
     ):
         super().__init__(
             vol_bnds,
@@ -118,6 +94,8 @@ class TSDFPlanner(TSDFPlannerBase):
         # about frontier allocation
         self.frontier_map = np.zeros(self._vol_dim[:2], dtype=int)
         self.frontier_counter = 1
+        self.enable_frontier_grouping = enable_frontier_grouping
+        self.frontier_group_counter = 1
 
         # about storing occupancy information on each step
         self.unexplored = None
@@ -127,6 +105,8 @@ class TSDFPlanner(TSDFPlannerBase):
         self.unexplored_neighbors = None
         self.occupied_map_camera = None
 
+        self.explored_map = np.zeros((self._vol_dim[0], self._vol_dim[2]), dtype=bool)
+
     def update_frontier_map(
         self,
         pts,
@@ -135,7 +115,6 @@ class TSDFPlanner(TSDFPlannerBase):
         cnt_step: int,
         save_frontier_image: bool = False,
         eps_frontier_dir=None,
-        prompt_img_size: Tuple[int, int] = (320, 320),
     ) -> bool:
         pts_habitat = pts.copy()
         pts = pos_habitat_to_normal(pts)
@@ -359,16 +338,19 @@ class TSDFPlanner(TSDFPlannerBase):
                         direction=np.array([np.cos(ang), np.sin(ang)]),
                     ):
                         # create a new frontier with the old image
-                        old_img_path = frontier.image
+                        old_img_path = frontier.image_path
                         old_img_feature = frontier.feature
+                        reuse_group_id = getattr(frontier, "group_id", None)
                         filtered_frontiers.append(
                             self.create_frontier(
                                 valid_ft_angles[update_ft_idx],
                                 frontier_edge_areas=frontier_edge_areas,
                                 cur_point=cur_point,
+                                group_id=reuse_group_id,
+                                reuse_frontier_id=frontier.frontier_id,
                             )
                         )
-                        filtered_frontiers[-1].image = old_img_path
+                        filtered_frontiers[-1].image_path = old_img_path
                         filtered_frontiers[-1].target_detected = (
                             frontier.target_detected
                         )
@@ -392,41 +374,19 @@ class TSDFPlanner(TSDFPlannerBase):
                     )
                 )
 
-        # Turn to face each frontier point and get rgb image
-        for i, frontier in enumerate(self.frontiers):
-            pos_habitat = self.voxel2habitat(frontier.position)
-            assert (frontier.image is None and frontier.feature is None) or (
-                frontier.image is not None and frontier.feature is not None
-            ), f"{frontier.image}, {frontier.feature is None}"
-            # Turn to face the frontier point
-            if frontier.image is None:
-                view_frontier_direction = np.array(
-                    [
-                        pos_habitat[0] - pts_habitat[0],
-                        0.0,
-                        pos_habitat[2] - pts_habitat[2],
-                    ]
-                )
-                obs = scene.get_frontier_observation(
-                    pts_habitat, view_frontier_direction
-                )
-                frontier_obs = obs["color_sensor"]
-
-                if save_frontier_image:
-                    assert os.path.exists(
-                        eps_frontier_dir
-                    ), f"Error in update_frontier_map: {eps_frontier_dir} does not exist"
-                    plt.imsave(
-                        os.path.join(eps_frontier_dir, f"{cnt_step}_{i}.png"),
-                        frontier_obs,
-                    )
-                processed_rgb = resize_image(
-                    frontier_obs, prompt_img_size[0], prompt_img_size[1]
-                )
-                frontier.image = f"{cnt_step}_{i}.png"
-                frontier.feature = processed_rgb
-
         return True
+
+    def set_target_point_from_observation(self, target_map_pos: np.ndarray):
+        """Sets the navigation target directly from an observation point, creating a dummy max_point."""
+        self.target_point = np.array(target_map_pos)
+        # Create a dummy SnapShot for max_point to ensure agent_step logic works correctly
+        self.max_point = SnapShot(
+            image='observation_target',
+            color=(0, 255, 0),
+            obs_point=np.array(target_map_pos),
+            position=np.array(target_map_pos)
+        )
+        return True  # 성공 시 True 반환
 
     def set_next_navigation_point(
         self,
@@ -531,10 +491,25 @@ class TSDFPlanner(TSDFPlannerBase):
                         max_obs_dist=cfg.final_observe_distance / self._voxel_size + 1,
                     )
                 if target_point is None:
-                    logging.error(
-                        f"Error in set_next_navigation_point: cannot find a proper observation point for the snapshot"
+                    logging.warning(
+                        "set_next_navigation_point: no valid observation point in voxel map; "
+                        "falling back to pathfinder-based search."
                     )
-                    return False
+                    snapshot_center = choice.position
+                    target_point_normal = (
+                        snapshot_center * self._voxel_size + self._vol_origin[:2]
+                    )
+                    target_point_normal = np.append(target_point_normal, pts[-1])
+                    target_point_hab = pos_normal_to_habitat(target_point_normal)
+                    target_navigable_point_habitat = get_proper_observe_point_with_pathfinder(
+                        target_point_hab, pathfinder, height=pts[-1]
+                    )
+                    if target_navigable_point_habitat is None:
+                        logging.error(
+                            "Error in set_next_navigation_point: cannot find a proper observation point for the snapshot"
+                        )
+                        return False
+                    target_point = self.habitat2voxel(target_navigable_point_habitat)[:2]
 
                 self.target_point = target_point
                 return True
@@ -855,6 +830,20 @@ class TSDFPlanner(TSDFPlannerBase):
                     )
 
                 ax1.add_patch(arrow)
+                
+                # --- FIX: Add frontier ID text to the visualization ---
+                ax1.text(
+                    frontier.position[1], 
+                    frontier.position[0], 
+                    str(frontier.frontier_id),
+                    fontsize=10,
+                    color='white',
+                    fontweight='bold',
+                    ha='center',
+                    va='center',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='black', alpha=0.5)
+                )
+                # --- FIX END ---
 
         # Convert back to world coordinates
         next_point_normal = next_point * self._voxel_size + self._vol_origin[:2]
@@ -863,9 +852,11 @@ class TSDFPlanner(TSDFPlannerBase):
         next_yaw = np.arctan2(direction[1], direction[0]) - np.pi / 2
 
         # update the path points
+        updated_path_points = None
         if path_points is not None:
+            path_points_2d_normal = [pos_habitat_to_normal(p)[:2] for p in path_points]
             updated_path_points = self.update_path_points(
-                path_points, next_point_normal
+                path_points_2d_normal, next_point_normal
             )
         else:
             updated_path_points = None
@@ -878,10 +869,6 @@ class TSDFPlanner(TSDFPlannerBase):
         ]
         self._explore_vol_cpu[near_coords[:, 0], near_coords[:, 1], :] = 1
 
-        if target_arrived:
-            self.max_point = None
-            self.target_point = None
-
         return (
             self.normal2habitat(next_point_normal),
             next_yaw,
@@ -889,6 +876,58 @@ class TSDFPlanner(TSDFPlannerBase):
             fig,
             updated_path_points,
             target_arrived,
+        )
+
+    def get_unexplored_volume_from_frontier(self, frontier: Frontier) -> int:
+        """
+        Calculates the size of the unexplored area connected to a given frontier.
+        Uses a Breadth-First Search (BFS) on the explored map.
+        """
+        # Get the frontier's starting point and clamp it to be within map bounds
+        r, c = frontier.position.astype(int)
+        r = np.clip(r, 0, self.explored_map.shape[0] - 1)
+        c = np.clip(c, 0, self.explored_map.shape[1] - 1)
+        start_node = (r, c)
+
+        # Check if the start node is valid (it might be on an already explored cell after clamping)
+        if self.explored_map[start_node[0], start_node[1]]:
+            # This can happen if the map was updated after frontier generation
+            return 0
+
+        q = [start_node]
+        visited = {start_node}
+        count = 0
+
+        while q:
+            r, c = q.pop(0)
+            count += 1
+
+            # Explore neighbors
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nr, nc = r + dr, c + dc
+                
+                # Check bounds
+                if not (0 <= nr < self.explored_map.shape[0] and 0 <= nc < self.explored_map.shape[1]):
+                    continue
+                
+                # If neighbor is unexplored and not visited, add to queue
+                if not self.explored_map[nr, nc] and (nr, nc) not in visited:
+                    visited.add((nr, nc))
+                    q.append((nr, nc))
+        
+        return count
+
+    def set_target_point_from_observation(self, target_map_pos: Tuple[int, int]):
+        """
+        Sets a temporary target point based on an observation's direction.
+        """
+        self.target_point = np.array(target_map_pos)
+        # Create a dummy SnapShot for max_point to ensure agent_step logic works correctly
+        self.max_point = SnapShot(
+            image='observation_target',
+            color=(0, 255, 0),
+            obs_point=np.array(target_map_pos),
+            position=np.array(target_map_pos)
         )
 
     def get_island_around_pts(self, pts, fill_dim=0.4, height=0.4):
@@ -949,7 +988,12 @@ class TSDFPlanner(TSDFPlannerBase):
         return region_map
 
     def create_frontier(
-        self, ft_data: dict, frontier_edge_areas, cur_point
+        self,
+        ft_data: dict,
+        frontier_edge_areas,
+        cur_point,
+        group_id: Optional[int] = None,
+        reuse_frontier_id: Optional[int] = None,
     ) -> Frontier:
         ft_direction = np.array([np.cos(ft_data["angle"]), np.sin(ft_data["angle"])])
 
@@ -998,16 +1042,33 @@ class TSDFPlanner(TSDFPlannerBase):
         region = ft_data["region"]
 
         # allocate an id for the frontier
-        # assert np.all(self.frontier_map[region] == 0)
-        frontier_id = self.frontier_counter
-        self.frontier_map[region] = frontier_id
-        self.frontier_counter += 1
+        if reuse_frontier_id is not None:
+            frontier_id = reuse_frontier_id
+        else:
+            frontier_id = self.frontier_counter
+            self.frontier_counter += 1
 
+        # frontier_map 업데이트
+        # 재사용 시 혹시 기존 영역이 남아있을 수 있으므로 우선 지운 뒤 할당
+        self.frontier_map[self.frontier_map == frontier_id] = 0
+        self.frontier_map[region] = frontier_id
+
+        # frontier_counter는 항상 현재까지 사용된 최대 ID보다 큰 값이 되도록 유지
+        if self.frontier_counter <= frontier_id:
+            self.frontier_counter = frontier_id + 1
+
+        if self.enable_frontier_grouping:
+            if group_id is None:
+                group_id = self.frontier_group_counter
+                self.frontier_group_counter += 1
+        else:
+            group_id = None
         return Frontier(
             position=center,
             orientation=ft_direction,
             region=region,
             frontier_id=frontier_id,
+            group_id=group_id,
         )
 
     def free_frontier(self, frontier: Frontier):

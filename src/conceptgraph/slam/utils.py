@@ -342,7 +342,7 @@ def merge_obj2_into_obj1(
     extend_attributes = ["class_id"]
     add_attributes = ["num_detections"]
     skip_attributes = ["id", "class_name"]  # 'inst_color' just keeps obj1's
-    custom_handled = ["pcd", "bbox", "clip_ft", "conf", "image", "image_crop"]
+    custom_handled = ["pcd", "bbox", "clip_ft", "vlm_ft", "conf", "image", "image_crop"]
 
     # Check for unhandled keys and throw an error if there are
     all_handled_keys = set(
@@ -390,11 +390,12 @@ def merge_obj2_into_obj1(
     obj1["bbox"] = get_bounding_box(spatial_sim_type, obj1["pcd"])
     obj1["bbox"].color = [0, 1, 0]
 
-    # Merge and normalize 'clip_ft'
+    # Merge and normalize 'clip_ft' / 'vlm_ft'
     obj1["clip_ft"] = (obj1["clip_ft"] * n_obj1_det + obj2["clip_ft"] * n_obj2_det) / (
         n_obj1_det + n_obj2_det
     )
     obj1["clip_ft"] = F.normalize(obj1["clip_ft"], dim=0)
+    obj1["vlm_ft"] = obj1["clip_ft"]
 
     # TODO: not sure how to handle image merging yet
 

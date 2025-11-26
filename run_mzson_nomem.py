@@ -7,10 +7,10 @@ os.environ["HABITAT_SIM_LOG"] = (
 )
 os.environ["MAGNUM_LOG"] = "quiet"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 # OpenAI API 키 설정
-from mzson.const import OPENAI_KEY
+from src.const import OPENAI_KEY
 os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 
 import argparse
@@ -28,20 +28,20 @@ import habitat_sim
 
 from ultralytics import SAM, YOLOWorld
 
-from mzson.habitat import (
+from src.habitat import (
     pose_habitat_to_tsdf, pos_habitat_to_normal
 )
-from mzson.geom import get_cam_intr, get_scene_bnds
-from mzson.tsdf_planner import TSDFPlanner
-from mzson.scene_goatbench import Scene
-from mzson.utils import (
+from src.geom import get_cam_intr, get_scene_bnds
+from src.tsdf_planner import TSDFPlanner
+from src.scene_goatbench import Scene
+from src.utils import (
     calc_agent_subtask_distance, get_pts_angle_goatbench,
 )
-from mzson.goatbench_utils import prepare_goatbench_navigation_goals
-from mzson.logger import MZSONLogger
-from mzson.siglip_itm import SigLipITM
-from mzson.descriptor_extractor import DescriptorExtractor, DescriptorExtractorConfig
-from mzson.data_models import Frontier
+from src.goatbench_utils import prepare_goatbench_navigation_goals
+from src.logger_mzson import MZSONLogger
+from src.siglip_itm import SigLipITM
+from src.descriptor_extractor import DescriptorExtractor, DescriptorExtractorConfig
+from src.data_models import Frontier
 
 
 class ElapsedTimeFormatter(logging.Formatter):
@@ -258,7 +258,8 @@ def run_evaluation(app_state: AppState, start_ratio: float, end_ratio: float, sp
                         continue
 
                     # NOTE: 매 subtask마다 새로운 TSDF planner 생성 (frontier 완전 초기화)
-                    logging.info(f"Creating new TSDF planner for subtask {subtask_idx + 1} (frontier reset)")
+                    # 현재 위치(pts)에서 TSDF를 시작합니다.
+                    logging.info(f"Creating new TSDF planner for subtask {subtask_idx + 1} from current position (frontier reset)")
                     tsdf_planner = TSDFPlanner(
                         vol_bnds=tsdf_bnds, voxel_size=cfg.tsdf_grid_size, floor_height=floor_height,
                         floor_height_offset=0, pts_init=pts, init_clearance=cfg.init_clearance * 2,
@@ -292,6 +293,8 @@ def run_evaluation(app_state: AppState, start_ratio: float, end_ratio: float, sp
                         tsdf_planner=tsdf_planner,
                     )
                     global_step = task_result.get("final_global_step", global_step)
+                    pts = task_result.get("final_position", pts)
+                    angle = task_result.get("final_angle", angle)
                     
                 app_state.logger.save_results()
                 if not cfg.save_visualization:
@@ -323,7 +326,7 @@ def run_subtask(
 ):
     """
     하나의 서브태스크를 자율적으로 수행합니다.
-    NOTE: 메모리 없는 버전 - 매 subtask마다 독립적으로 탐색
+    NOTE: 메모리는 초기화되지만, 에이전트 위치는 이전 subtask에서 이어받음
     """
     # Initialize the observation history for this specific subtask
     episode_context["subtask_full_observation_history"] = {}
@@ -339,17 +342,43 @@ def run_subtask(
     success_by_distance = False
 
     # --- Phase 1: Goal Pre-processing ---
-    target_objects = []
+    target_objects: List[str] = []
+    primary_target: Optional[str] = None
     if goal_type == "object":
-        target_objects = goal if isinstance(goal, list) else [goal]
+        raw_targets = goal if isinstance(goal, list) else [goal]
+        if raw_targets:
+            primary_target = next(
+                (str(t).strip() for t in raw_targets if isinstance(t, str) and str(t).strip()),
+                None,
+            )
     elif goal_type == "description":
         logging.info(f"Goal is a description. Extracting target objects...")
         main_targets, _context_objects = app_state.desc_extractor.extract_target_objects_from_description(goal)
-        target_objects = main_targets
+        if main_targets:
+            primary_target = next(
+                (str(t).strip() for t in main_targets if isinstance(t, str) and str(t).strip()),
+                None,
+            )
+        if primary_target is None and isinstance(goal, list) and goal:
+            candidate = goal[0]
+            if isinstance(candidate, str) and candidate.strip():
+                primary_target = candidate.strip()
+        if primary_target is None and isinstance(goal, str) and goal.strip():
+            primary_target = goal.strip()
     elif goal_type == "image":
         logging.info("Goal is an image. Extracting keywords for ITM scoring...")
-        target_objects = app_state.desc_extractor.extract_keywords_from_image(goal)
-        logging.info(f"Extracted keywords from image goal: {target_objects}")
+        keywords = app_state.desc_extractor.extract_keywords_from_image_modified(goal)
+        logging.info(f"Extracted keywords from image goal: {keywords}")
+        if keywords:
+            primary_target = next(
+                (kw.strip() for kw in keywords if isinstance(kw, str) and kw.strip() and kw.lower().strip() != "detection failed"),
+                None,
+            )
+    if primary_target:
+        target_objects = [primary_target]
+    else:
+        target_objects = []
+        logging.warning("No valid primary target could be determined; proceeding without semantic target.")
     
     logging.info(f"Refined Target Objects: {target_objects}")
 
@@ -494,26 +523,65 @@ def run_subtask(
                     logging.info("Vicinity of long-term target reached. Clearing for full re-evaluation.")
                     tsdf_planner.max_point = None
             
-        # --- Visualization (optional) ---
-        if app_state.cfg.save_visualization and fig is not None:
-            app_state.logger.log_step_visualizations(
-                global_step=global_step,
-                subtask_id=subtask_metadata["subtask_id"],
-                subtask_metadata=subtask_metadata,
-                fig=fig,
-                candidates_info=candidates_info
-            )
-
         # --- 공통 실행: 최종 성공 여부 판정 ---
         agent_subtask_distance = calc_agent_subtask_distance(
             current_pts, subtask_metadata["viewpoints"], scene.pathfinder
         )
         success_by_distance = agent_subtask_distance < app_state.cfg.success_distance
         
+        # --- Visualization (optional) ---
+        if app_state.cfg.save_visualization and fig is not None:
+            if success_by_distance:
+                # Generate new topdown map at final success position
+                logging.info(
+                    f"SUCCESS: Distance condition met at step {global_step} ({agent_subtask_distance:.2f}m < 1.0m). Stopping."
+                )
+                
+                # Set a dummy target at current position to generate visualization
+                success_voxel_pos = tsdf_planner.habitat2voxel(current_pts)[:2]
+                tsdf_planner.target_point = success_voxel_pos
+                from src.tsdf_planner import SnapShot
+                tsdf_planner.max_point = SnapShot(
+                    image='success_position',
+                    color=(0, 255, 0),
+                    obs_point=success_voxel_pos,
+                    position=success_voxel_pos
+                )
+                
+                # Generate visualization at success position
+                success_step_vals = tsdf_planner.agent_step(
+                    pts=current_pts,
+                    angle=current_angle,
+                    objects=scene.objects,
+                    snapshots=scene.snapshots,
+                    pathfinder=scene.pathfinder,
+                    cfg=app_state.cfg.planner if hasattr(app_state.cfg, "planner") else app_state.cfg,
+                    save_visualization=True,
+                )
+                
+                if success_step_vals[0] is not None:
+                    success_fig = success_step_vals[3]  # fig is at index 3
+                    if success_fig is not None:
+                        app_state.logger.save_success_visualization(
+                            subtask_id=subtask_metadata["subtask_id"],
+                            subtask_metadata=subtask_metadata,
+                            fig=success_fig
+                        )
+                
+                # Clear the dummy target
+                tsdf_planner.target_point = None
+                tsdf_planner.max_point = None
+            else:
+                # Save regular step visualization
+                app_state.logger.log_step_visualizations(
+                    global_step=global_step,
+                    subtask_id=subtask_metadata["subtask_id"],
+                    subtask_metadata=subtask_metadata,
+                    fig=fig,
+                    candidates_info=candidates_info
+                )
+        
         if success_by_distance:
-            logging.info(
-                f"SUCCESS: Distance condition met at step {global_step} ({agent_subtask_distance:.2f}m < 1.0m). Stopping."
-            )
             break
             
         # Check for max steps

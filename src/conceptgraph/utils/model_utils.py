@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from PIL import Image
 from scipy.spatial.distance import cosine
+import supervision as sv
+from typing import List, Tuple
 
 # def get_sam_predictor(cfg) -> SamPredictor:
 #     if cfg.sam_variant == "sam":
@@ -139,83 +141,36 @@ def compute_clip_features(
 
 
 # @profile
-def compute_clip_features_batched(
-    image,
-    detections,
-    clip_model,
-    clip_preprocess,
-    clip_tokenizer,
-    classes,
-    device,
-    prompt_h=None,
-    prompt_w=None,
-):
-
-    image = Image.fromarray(image)
-    padding = 20  # Adjust the padding amount as needed
-
+def compute_vlm_features_batched(
+    image_rgb: np.ndarray,
+    detections: sv.Detections,
+    vlm_model,  # Expects an object like SigLipITM with encode_image, encode_texts methods
+    classes: List[str],
+    device: torch.device,
+) -> Tuple[List[np.ndarray], torch.Tensor, torch.Tensor]:
+    """
+    Extracts image and text features for given detections using a generic VLM model.
+    """
     image_crops = []
-    preprocessed_images = []
-    text_tokens = []
+    # Note: simple list comprehension for cropping might be slow if many detections.
+    # Consider optimized batch cropping if performance becomes an issue.
+    for xyxy in detections.xyxy:
+        x1, y1, x2, y2 = [int(i) for i in xyxy]
+        # Ensure crop dimensions are valid
+        if x1 < x2 and y1 < y2:
+            image_crops.append(image_rgb[y1:y2, x1:x2])
 
-    original_width, original_height = image.size
-    if prompt_h is not None and prompt_w is not None:
-        scale_w, scale_h = prompt_w / original_width, prompt_h / original_height
-    else:
-        scale_w, scale_h = 1, 1
+    if not image_crops:
+        # Return empty tensors with correct device and type for consistency
+        return [], torch.empty((0, vlm_model.model.visual.output_dim), device=device), torch.empty((0, vlm_model.model.text.output_dim), device=device)
+        
+    # Process images in a batch
+    image_features = vlm_model.encode_image(image_crops)
 
-    # Prepare data for batch processing
-    for idx in range(len(detections.xyxy)):
-        x_min, y_min, x_max, y_max = detections.xyxy[idx]
-        image_width, image_height = image.size
-        left_padding = min(padding, x_min)
-        top_padding = min(padding, y_min)
-        right_padding = min(padding, image_width - x_max)
-        bottom_padding = min(padding, image_height - y_max)
+    # Process texts for all unique classes
+    text_features = vlm_model.encode_texts(classes)
 
-        # get the image crop without padding
-        image_crops.append(image.crop((x_min, y_min, x_max, y_max)))
-
-        x_min -= left_padding
-        y_min -= top_padding
-        x_max += right_padding
-        y_max += bottom_padding
-
-        preprocessed_image = clip_preprocess(
-            image.crop((x_min, y_min, x_max, y_max))
-        ).unsqueeze(0)
-        preprocessed_images.append(preprocessed_image)
-
-        class_id = detections.class_id[idx]
-        text_tokens.append(classes[class_id])
-
-    # Convert lists to batches
-    preprocessed_images_batch = torch.cat(preprocessed_images, dim=0).to(device)
-    text_tokens_batch = clip_tokenizer(text_tokens).to(device)
-
-    # Batch inference
-    with torch.no_grad():
-        image_features = clip_model.encode_image(preprocessed_images_batch)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-
-        # text_features = clip_model.encode_text(text_tokens_batch)
-        # text_features /= text_features.norm(dim=-1, keepdim=True)
-
-    # Convert to numpy
-    image_feats = image_features.cpu().numpy()
-    # text_feats = text_features.cpu().numpy()
-    # image_feats = []
-    text_feats = []
-
-    # resize image crops
-    if prompt_h is not None and prompt_w is not None:
-        for i in range(len(image_crops)):
-            crop_w, crop_h = image_crops[i].size
-            image_crops[i] = image_crops[i].resize(
-                (int(crop_w * scale_w), int(crop_h * scale_h))
-            )
-
-    return image_crops, image_feats, text_feats
+    return image_crops, image_features, text_features
 
 
 def compute_ft_vector_closeness_statistics(unbatched, batched):

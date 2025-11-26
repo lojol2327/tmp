@@ -1,0 +1,123 @@
+# General
+seed: 77
+exp_name: "aeqa_mzson_nomem"
+output_parent_dir: "results/aeqa_mzson"
+scene_dataset_config_path: "data/hm3d_annotated_basis.scene_dataset_config.json"
+scene_data_path: "data/scene_datasets/hm3d/"
+
+# A-EQA specific
+# questions_list_path: "data/aeqa_questions-41.json"  
+questions_list_path: "data/aeqa_questions-184.json" 
+
+concept_graph_config_path: "cfg/concept_graph_default.yaml"
+
+# about detection model
+yolo_model_name: yolov8x-world.pt
+sam_model_name: sam_l.pt
+class_set: scannet200  # use the 200-class set for yolo-world detector
+
+# about snapshots clustering
+min_detection: 1
+
+# about agent
+agent:
+  height: 1.41 ### Stretch3
+  radius: 0.17
+  step_size: 0.25 
+  turn_angle: 30.0
+  tilt_angle: 30.0
+
+# camera, image
+camera_height: 1.5
+camera_tilt_deg: -30
+img_width: 1280
+img_height: 1280
+hfov: 120
+# min_depth: 0.5 # Minimum reliable depth from the sensor (in meters)
+# max_depth: 5.0 # Maximum reliable depth from the sensor (in meters)
+
+# about A-EQA evaluation
+success_distance: 1.0  # the distance threshold for a successful navigation
+
+# whether to save visualization (which is slow)
+save_visualization: true
+
+# the image size for prompting gpt-4o
+prompt_w: 360
+prompt_h: 360
+
+# DescriptorExtractor settings
+use_chain_descriptors: true
+gpt_model: "gpt-4o"
+descriptors_per_frontier: 4
+
+# navigation
+init_clearance: 0.3
+max_step_room_size_ratio: 2  # Dynamic step limit based on scene size
+num_scan_views: 6  # M-ZSON: Full 360-degree scan (vs 3D-Mem's limited multi-view)
+
+# NOTE: 3D-Mem uses fixed num_step=50 and phase-based views
+# We use adaptive steps and consistent 360-degree scanning for better coverage
+
+# about tsdf, depth map, and frontier updates
+explored_depth: 1.7
+tsdf_grid_size: 0.1
+margin_w_ratio: 0.25
+margin_h_ratio: 0.6
+planner:
+  eps: 1
+  max_dist_from_cur_phase_1: 1  # when the target object is not found, explore the frontiers with this step length
+  max_dist_from_cur_phase_2: 1  # when the target object is found, go to the target object with this step length
+  final_observe_distance: 1.5  # in phase 2, find a place that is this far from the target object to observe it
+  surrounding_explored_radius: 0.7
+
+  # about frontier selection
+  frontier_edge_area_min: 4 
+  frontier_edge_area_max: 6
+  frontier_area_min: 8
+  frontier_area_max: 9
+  min_frontier_area: 20  # the frontier should have at least this many pixels
+  max_frontier_angle_range_deg: 150  # the angle spanned by the pixels in a frontier should not be larger than this
+  region_equal_threshold: 0.80
+
+# about scene graph construction
+scene_graph:
+  confidence: 0.003
+  nms_threshold: 0.1
+  iou_threshold: 0.5
+  obj_include_dist: 3.5
+  target_obj_iou_threshold: 0.6
+
+
+siglip_backend: "open_clip"
+
+# SigLIP
+siglip_model_name: "ViT-B-16-SigLIP-384"
+siglip_pretrained: "webli"
+
+# CLIP
+# siglip_model_name: "ViT-B-16"
+# siglip_pretrained: "laion2b_s34b_b88k"
+
+
+# Navigation settings
+goal_verification_threshold: 0.45
+direct_goal_detect_conf: 0.4 # Confidence threshold for direct goal detection using YOLO.
+relevant_view_angle_threshold_deg: 30 # The angle threshold to consider a view relevant to a frontier. Should be roughly hfov/2.
+
+# Frontier Evaluation settings
+# --- Frontier Selection Weights (v3.2) ---
+# Semantic_Score = w_itm_score * ITM_Score + w_vlm_score * VLM_Likelihood
+w_itm_score: 0.5 # Weight for the evidence-based score (ITM on descriptors)
+w_vlm_score: 0.5 # Weight for the VLM's common-sense likelihood score
+
+# The agent resorts to exploration if all frontier scores are below this threshold.
+low_score_threshold: 0.5
+# If the score difference between the top two frontiers is less than this,
+# exploration score is used as a tie-breaker.
+tie_breaking_threshold: 0.05
+
+# --- A-EQA Specific QA Settings ---
+qa_trigger_itm_threshold: 0.6  # ITM score threshold to trigger answer attempt (target object found)
+qa_confidence_threshold: 0.7  # Minimum confidence to consider answer successful
+descriptor_relevance_threshold: 0.2  # Semantic score threshold for descriptor accumulation (0.0=all, 1.0=only best)

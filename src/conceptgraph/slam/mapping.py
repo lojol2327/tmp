@@ -69,6 +69,14 @@ def compute_visual_similarities(
     Returns:
         A MxN tensor of visual similarities
     """
+    def _ensure_clip_ft(entries):
+        for item in entries.values():
+            if "clip_ft" not in item and "vlm_ft" in item:
+                item["clip_ft"] = item["vlm_ft"]
+
+    _ensure_clip_ft(detection_list)
+    _ensure_clip_ft(objects)
+
     det_fts = detection_list.get_stacked_values_torch("clip_ft")  # (M, D)
     obj_fts = objects.get_stacked_values_torch("clip_ft")  # (N, D)
 

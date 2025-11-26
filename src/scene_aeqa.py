@@ -9,7 +9,7 @@ from quaternion import as_float_array
 import supervision as sv
 import logging
 from collections import Counter
-from typing import List, Optional, Tuple, Dict, Union
+from typing import List, Optional, Tuple, Dict, Union, Any
 import copy
 
 from habitat_sim.utils.common import (
@@ -54,7 +54,7 @@ from src.conceptgraph.slam.mapping import (
     aggregate_similarities,
     match_detections_to_objects,
 )
-from src.conceptgraph.utils.model_utils import compute_clip_features_batched
+from src.conceptgraph.utils.model_utils import compute_vlm_features_batched
 
 
 class Scene:
@@ -65,14 +65,13 @@ class Scene:
         graph_cfg,
         detection_model,
         sam_predictor,
-        clip_model,
-        clip_preprocess,
-        clip_tokenizer,
+        vlm_model, # Expects a VLM instance like SigLipITM
+        device,
     ):
         self.cfg = cfg
         # concept graph configuration
         self.cfg_cg = graph_cfg
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
 
         # about the loading the scene
         split = "train" if int(scene_id.split("-")[0]) < 800 else "val"
@@ -119,6 +118,7 @@ class Scene:
             "hfov": cfg.hfov,
             "scene_dataset_config_file": cfg.scene_dataset_config_path,
             "camera_tilt": cfg.camera_tilt_deg * np.pi / 180,
+            "agent_cfg": cfg.agent,
         }
         if os.path.exists(semantic_texture_path) and os.path.exists(
             scene_semantic_annotation_path
@@ -150,7 +150,7 @@ class Scene:
         # set agent
         self.agent = self.simulator.initialize_agent(sim_settings["default_agent"])
 
-        self.cam_intrinsic = get_cam_intr(cfg.img_width, cfg.img_height, cfg.hfov)
+        self.cam_intrinsic = get_cam_intr(cfg.hfov, cfg.img_height, cfg.img_width)
 
         # about scene graph
         self.objects: MapObjectDict[int, Dict] = (
@@ -160,9 +160,10 @@ class Scene:
 
         self.snapshots: Dict[str, SnapShot] = {}  # image_path -> snapshot
         self.frames: Dict[str, SnapShot] = {}  # image_path -> all frames
-        self.all_observations: Dict[str, np.ndarray] = (
+        # 각 관찰의 상세 정보를 저장하는 구조로 변경
+        self.all_observations: Dict[str, Dict[str, Any]] = (
             {}
-        )  # image_path -> image, stores all actual observations at each step, used for querying vlm
+        )  # obs_name -> {"rgb": ndarray, "angle": float, "cam_pose": ndarray}
 
         self.clustering = SceneHierarchicalClustering(
             min_sample_split=0,
@@ -174,14 +175,19 @@ class Scene:
         self.detection_model.set_classes(self.obj_classes.get_classes_arr())
 
         self.sam_predictor = sam_predictor
+        self.vlm_model = vlm_model
 
-        self.clip_model = clip_model.to(self.device)
-        self.clip_preprocess = clip_preprocess
-        self.clip_tokenizer = clip_tokenizer
+    def close(self):
+        """명시적으로 시뮬레이터를 닫고 리소스를 해제합니다."""
+        if self.simulator:
+            self.simulator.close()
+            self.simulator = None
+            logging.info("Habitat simulator closed.")
 
     def __del__(self):
         try:
-            self.simulator.close()
+            if self.simulator:
+                self.simulator.close()
         except:
             pass
 
@@ -240,9 +246,17 @@ class Scene:
         self.agent.set_state(agent_state)
         obs = self.simulator.get_sensor_observations()
 
+        # get camera extrinsic matrix
+        sensor = self.agent.get_state().sensor_states["depth_sensor"]
+        quaternion_0 = sensor.rotation
+        translation_0 = sensor.position
+        cam_pose = np.eye(4)
+        cam_pose[:3, :3] = quaternion.as_rotation_matrix(quaternion_0)
+        cam_pose[:3, 3] = translation_0
+
         obs["color_sensor"] = rgba2rgb(obs["color_sensor"])
 
-        return obs
+        return obs, cam_pose
 
     def get_frontier_observation_and_detect_target(
         self,
@@ -375,12 +389,10 @@ class Scene:
             logging.debug("No detections left after filter_detections")
             return image_rgb, [], None
 
-        image_crops, image_feats, text_feats = compute_clip_features_batched(
+        image_crops, image_feats, text_feats = compute_vlm_features_batched(
             image_rgb,
             curr_det,
-            self.clip_model,
-            self.clip_preprocess,
-            self.clip_tokenizer,
+            self.vlm_model,
             obj_classes.get_classes_arr(),
             self.device,
         )
@@ -691,11 +703,31 @@ class Scene:
                 # These are for the entire 3D object
                 "pcd": gobs["pcd"][mask_idx],
                 "bbox": gobs["bbox"][mask_idx],
-                "clip_ft": to_tensor(gobs["image_feats"][mask_idx]),
                 # the snapshot name it belongs to
                 "image": None,
             }
 
+            image_feats = gobs.get("image_feats")
+            has_feats = False
+            feat_item = None
+            if image_feats is not None:
+                if hasattr(image_feats, "numel"):
+                    has_feats = image_feats.numel() > 0 and image_feats.shape[0] > mask_idx
+                    if has_feats:
+                        feat_item = image_feats[mask_idx]
+                elif isinstance(image_feats, np.ndarray):
+                    has_feats = image_feats.size > 0 and image_feats.shape[0] > mask_idx
+                    if has_feats:
+                        feat_item = image_feats[mask_idx]
+                elif isinstance(image_feats, list):
+                    has_feats = len(image_feats) > mask_idx
+                    if has_feats:
+                        feat_item = image_feats[mask_idx]
+            if has_feats and feat_item is not None:
+                feat_tensor = to_tensor(feat_item)
+                detected_object["vlm_ft"] = feat_tensor
+                detected_object["clip_ft"] = feat_tensor
+            
             detection_list[self.object_id_counter] = detected_object
             self.object_id_counter += 1
 
